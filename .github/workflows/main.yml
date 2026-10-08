@@ -2,7 +2,6 @@ name: Android Studio Release
 
 on:
   schedule:
-    # Every day at 04:00 UTC
     - cron: "0 4 * * *"
 
   workflow_dispatch:
@@ -15,88 +14,111 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Get latest Android Studio version
-        id: android-studio
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get latest Android Studio
+        id: studio
         shell: bash
         run: |
           set -euo pipefail
 
+          PAGE_URL="https://developer.android.com/studio"
+
+          echo "Fetching Android Studio page..."
+
           PAGE="$(curl -fsSL \
             -H "User-Agent: Mozilla/5.0" \
-            "https://developer.android.com/studio")"
+            "$PAGE_URL")"
 
-          # Find the Linux archive
-          DOWNLOAD_URL="$(
+          # Find the Linux download filename
+          FILE_NAME="$(
             printf '%s' "$PAGE" |
-            grep -oE 'https://[^"]+android-studio-[^"]+-linux\.tar\.gz' |
+            grep -oE 'android-studio-[a-z0-9]+(-[a-z0-9]+)*-linux\.tar\.gz' |
             head -n 1
           )"
 
-          # Fallback: extract the filename and construct the Google URL
-          if [ -z "$DOWNLOAD_URL" ]; then
-            FILE_NAME="$(
-              printf '%s' "$PAGE" |
-              grep -oE 'android-studio-[a-z0-9]+(-patch[0-9]+)?-linux\.tar\.gz' |
-              head -n 1
-            )"
-
-            if [ -z "$FILE_NAME" ]; then
-              echo "Could not find Android Studio Linux archive."
-              exit 1
-            fi
-
-            DOWNLOAD_URL="https://redirector.gvt1.com/edgedl/android/studio/$(date +%Y.%m)/$FILE_NAME"
+          if [ -z "$FILE_NAME" ]; then
+            echo "ERROR: Could not find Linux Android Studio archive."
+            exit 1
           fi
 
-          FILE_NAME="$(basename "$DOWNLOAD_URL")"
+          echo "Found file: $FILE_NAME"
 
-          # Extract the version from Google's page
+          # Extract version from the page.
+          # Example:
+          # Android Studio Rabbit 1 | 2026.2.1
           VERSION="$(
             printf '%s' "$PAGE" |
-            grep -oE 'Android Studio [A-Za-z]+ [0-9]+ \| [0-9]+\.[0-9]+\.[0-9]+' |
-            head -n 1 |
-            grep -oE '[0-9]+\.[0-9]+\.[0-9]+' |
+            grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+' |
             head -n 1
           )"
 
           if [ -z "$VERSION" ]; then
-            echo "Could not determine Android Studio version."
+            echo "ERROR: Could not determine Android Studio version."
             exit 1
           fi
 
           echo "Latest version: $VERSION"
+
+          # Extract the exact Google download URL.
+          DOWNLOAD_URL="$(
+            printf '%s' "$PAGE" |
+            grep -oE 'https://[^"]+' |
+            grep -F "$FILE_NAME" |
+            head -n 1
+          )"
+
+          if [ -z "$DOWNLOAD_URL" ]; then
+            echo "Google did not expose a direct URL in the page."
+            echo "Trying Google's standard download redirect..."
+
+            DOWNLOAD_URL="https://redirector.gvt1.com/edgedl/android/studio/ide-zips/$FILE_NAME"
+          fi
+
           echo "Download URL: $DOWNLOAD_URL"
-          echo "Filename: $FILE_NAME"
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
           echo "filename=$FILE_NAME" >> "$GITHUB_OUTPUT"
+          echo "url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Check existing release
+      - name: Check whether release already exists
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.android-studio.outputs.version }}
+          VERSION: ${{ steps.studio.outputs.version }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           TAG="android-studio-$VERSION"
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            >/dev/null 2>&1; then
+
+            echo "Release already exists:"
+            echo "$TAG"
+
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Release $TAG already exists."
           else
+            echo "New version detected:"
+            echo "$VERSION"
+
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Release $TAG does not exist."
           fi
 
       - name: Download Android Studio
         if: steps.release.outputs.exists == 'false'
         env:
-          URL: ${{ steps.android-studio.outputs.url }}
-          FILE: ${{ steps.android-studio.outputs.filename }}
+          URL: ${{ steps.studio.outputs.url }}
+          FILE: ${{ steps.studio.outputs.filename }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          echo "Downloading $FILE..."
+          echo "Downloading:"
+          echo "$URL"
 
           curl \
             --fail \
@@ -106,17 +128,23 @@ jobs:
             --output "$FILE" \
             "$URL"
 
-          echo "Download completed."
+          echo "Download complete."
 
-      - name: Calculate SHA256
+          ls -lh "$FILE"
+
+      - name: Verify SHA-256
         if: steps.release.outputs.exists == 'false'
         id: checksum
         env:
-          FILE: ${{ steps.android-studio.outputs.filename }}
+          FILE: ${{ steps.studio.outputs.filename }}
+        shell: bash
         run: |
-          SHA256="$(sha256sum "$FILE" | cut -d' ' -f1)"
+          set -euo pipefail
 
-          echo "SHA256: $SHA256"
+          SHA256="$(sha256sum "$FILE" | awk '{print $1}')"
+
+          echo "SHA-256:"
+          echo "$SHA256"
 
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
 
@@ -124,24 +152,34 @@ jobs:
         if: steps.release.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.android-studio.outputs.version }}
-          FILE: ${{ steps.android-studio.outputs.filename }}
+          VERSION: ${{ steps.studio.outputs.version }}
+          FILE: ${{ steps.studio.outputs.filename }}
           SHA256: ${{ steps.checksum.outputs.sha256 }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           TAG="android-studio-$VERSION"
 
           gh release create "$TAG" \
             "$FILE" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Android Studio $VERSION" \
-            --notes "Android Studio $VERSION
+            --notes "## Android Studio $VERSION
 
-          Automatically downloaded from Google.
+          Automatically downloaded from Google's official Android Studio website.
 
           Official source:
           https://developer.android.com/studio
 
+          ### Linux
+
+          File:
+          \`$FILE\`
+
           SHA-256:
-          $SHA256" \
+          \`$SHA256\`" \
             --latest
 
-          echo "Release created: $TAG"
+          echo "Release created successfully:"
+          echo "$TAG"
